@@ -6,12 +6,11 @@ import pypdf
 st.set_page_config(page_title="Clinical Note Translator", page_icon="🩺", layout="wide")
 
 st.title("🩺 Medical Jargon & Clinical Note Translator")
-st.write("Extract text from clinical PDFs or paste raw notes, then translate them into clear language with audio readouts.")
+st.write("Extract text from clinical PDFs or paste raw notes, translate them, and ask follow-up questions.")
 
 # --- API KEY & CONFIGURATION SIDEBAR ---
 st.sidebar.header("⚙️ Configuration")
 
-# Retrieve API key from secrets or sidebar input
 api_key = st.secrets.get("OPENAI_API_KEY", "")
 if not api_key:
     api_key = st.sidebar.text_input("OpenAI API Key", type="password")
@@ -29,6 +28,10 @@ selected_voice = st.sidebar.selectbox(
     "Text-to-Speech Voice:",
     ["alloy", "echo", "fable", "onyx", "nova", "shimmer"]
 )
+
+# Initialize Chat History in Session State
+if "messages" not in st.session_state:
+    st.session_state["messages"] = []
 
 # --- INPUT SECTION (PASTE OR UPLOAD) ---
 st.subheader("1. Input Clinical Documentation")
@@ -90,6 +93,9 @@ if st.button("🚀 Translate Clinical Note", type="primary"):
 
                 translation = response.choices[0].message.content
                 st.session_state["latest_translation"] = translation
+                st.session_state["latest_source_text"] = extracted_text
+                # Reset chat history whenever a new document is translated
+                st.session_state["messages"] = []
 
             except Exception as e:
                 st.error(f"Translation Error: {e}")
@@ -115,18 +121,65 @@ if "latest_translation" in st.session_state:
             client = OpenAI(api_key=api_key)
             with st.spinner(f"Generating audio with voice '{selected_voice}'..."):
                 try:
-                    # Truncate text if it exceeds OpenAI TTS limit (4,096 chars)
                     audio_input = translation_text[:4000]
-
                     tts_response = client.audio.speech.create(
                         model="tts-1",
                         voice=selected_voice,
                         input=audio_input
                     )
-
-                    # Streamlit audio player accepts byte buffers
                     audio_bytes = tts_response.content
                     st.audio(audio_bytes, format="audio/mp3")
-
                 except Exception as e:
                     st.error(f"Audio Generation Error: {e}")
+
+    # --- 4. MULTI-TURN FOLLOW-UP CHAT ---
+    st.divider()
+    st.subheader("4. Ask Follow-Up Questions")
+    st.caption("Have questions about your diagnosis, medication schedule, or next steps? Ask below!")
+
+    # Display persistent chat conversation history
+    for message in st.session_state["messages"]:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
+
+    # Accept user chat input
+    if user_query := st.chat_input("e.g., What side effects should I watch out for with my new medications?"):
+        if not api_key:
+            st.error("OpenAI API Key required to ask follow-up questions.")
+        else:
+            # Append and display user prompt
+            with st.chat_message("user"):
+                st.markdown(user_query)
+            st.session_state["messages"].append({"role": "user", "content": user_query})
+
+            # Build grounded system context for follow-up questions
+            chat_system_prompt = (
+    f"You are an empathetic, clinical communication assistant explaining a medical note.\n"
+    f"Target Audience Persona: {selected_persona}\n\n"
+    f"Original Medical Document:\n{st.session_state.get('latest_source_text', '')}\n\n"
+    f"Translated Summary:\n{st.session_state.get('latest_translation', '')}\n\n"
+    f"--- STRICT BOUNDARIES & GUARDRAILS ---\n"
+    f"1. DOMAIN RESTRICTION: You MUST ONLY answer questions related to medicine, health, medical conditions, medications, clinical care, or the provided medical document.\n"
+    f"2. OFF-TOPIC REFUSAL: If the user asks an off-topic, non-medical question (e.g., sports, coding, recipes, history, general trivia, entertainment), politely decline with:\n"
+    f"   'I am designed strictly as a clinical assistant to help explain medical notes and health concepts. Please ask a question related to your health, medication, or clinical summary.'\n"
+    f"3. CLINICAL ACCURACY: Answer medical follow-up questions accurately based on the context above. If a question cannot be answered from the document, provide standard educational context and advise consulting their healthcare provider."
+)
+
+            api_messages = [{"role": "system", "content": chat_system_prompt}]
+            for msg in st.session_state["messages"]:
+                api_messages.append({"role": "user" if msg["role"] == "user" else "assistant", "content": msg["content"]})
+
+            client = OpenAI(api_key=api_key)
+            with st.chat_message("assistant"):
+                with st.spinner("Analyzing clinical context..."):
+                    try:
+                        chat_response = client.chat.completions.create(
+                            model="gpt-4o-mini",
+                            messages=api_messages,
+                            temperature=0.3
+                        )
+                        assistant_reply = chat_response.choices[0].message.content
+                        st.markdown(assistant_reply)
+                        st.session_state["messages"].append({"role": "assistant", "content": assistant_reply})
+                    except Exception as e:
+                        st.error(f"Chat Error: {e}")
